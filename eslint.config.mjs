@@ -26,4 +26,14 @@ export default [
             ],
         },
     },
+    {
+        files: ['packages/**/*.ts'],
+        ignores: ['packages/gill/**/*.ts'],
+        rules: {
+            "no-restricted-imports": ["error", {
+                "name": "@solana/kit",
+                "message": "Please use gill instead."
+            }],
+        }
+    }
 ];
