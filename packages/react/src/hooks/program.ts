@@ -9,7 +9,7 @@ import {
   useQueryClient,
   type UseQueryOptions,
 } from "@tanstack/react-query";
-import type { Account, Address, Instruction } from "gill";
+import type { Address, Instruction } from "gill";
 
 import { GILL_HOOK_CLIENT_KEY } from "../const.js";
 
@@ -17,7 +17,10 @@ type InstructionBuilder<TInput = any> = (input: TInput, config?: { programAddres
 
 type AccountFetcher<TData = any> = (rpc: any, address: Address, config?: any) => Promise<TData>;
 
-type SignAndSendFn = (instruction: Instruction, signer: any) => Promise<string>;
+type Signer = any;
+type SignerOrSigners = Signer | Signer[];
+
+type SignAndSendFn = (instruction: Instruction, signers?: SignerOrSigners) => Promise<string>;
 
 type ProgramHookConfig<
   TInstructions extends Record<string, InstructionBuilder<any>>,
@@ -26,6 +29,8 @@ type ProgramHookConfig<
   accounts: TAccounts;
   instructions: TInstructions;
   programAddress?: Address;
+  /** Time to wait after transaction confirmation before refetching (default: 500ms) */
+  refetchDelay?: number;
   signAndSend: SignAndSendFn;
 };
 
@@ -34,13 +39,20 @@ type UseProgramMutationInput<
   TAccounts extends Record<string, AccountFetcher<any>>,
   TInstructionName extends keyof TInstructions,
 > = Omit<
-  UseMutationOptions<string, Error, Parameters<TInstructions[TInstructionName]>[0] & { signer: any }>,
+  UseMutationOptions<
+    string,
+    Error,
+    Parameters<TInstructions[TInstructionName]>[0] & {
+      signer?: SignerOrSigners;
+    }
+  >,
   "mutationFn"
 > & {
   accounts?: Record<string, any> & {
     [K in keyof TAccounts]?: Parameters<TAccounts[K]>[0];
   };
-  instruction: TInstructionName; // Allow additional accounts beyond the defined ones
+  defaultSigners?: SignerOrSigners;
+  instruction: TInstructionName;
 };
 
 type UseProgramQueryInput<
@@ -56,19 +68,25 @@ export function createProgramHook<
   TInstructions extends Record<string, InstructionBuilder<any>>,
   TAccounts extends Record<string, AccountFetcher<any>>,
 >(config: ProgramHookConfig<TInstructions, TAccounts>) {
-  const refetchDelay = 1000;
+  const refetchDelay = config.refetchDelay ?? 500;
 
   function useProgramMutation<TInstructionName extends keyof TInstructions>(
     input: UseProgramMutationInput<TInstructions, TAccounts, TInstructionName>,
   ) {
     const queryClient = useQueryClient();
-    const { instruction, accounts, ...options } = input;
+    const { instruction, accounts, defaultSigners, ...options } = input;
     const instructionFn = config.instructions[instruction];
 
     return useMutation({
       ...options,
-      mutationFn: async (instructionInput: Parameters<TInstructions[TInstructionName]>[0] & { signer: any }) => {
-        const { signer, ...instructionParams } = instructionInput;
+      mutationFn: async (
+        instructionInput: Parameters<TInstructions[TInstructionName]>[0] & { signer?: SignerOrSigners },
+      ) => {
+        if (!instructionInput) {
+          throw new Error("Instruction input is required");
+        }
+        const { signer: inputSigner, ...instructionParams } = instructionInput;
+        const signerToUse = inputSigner !== undefined ? inputSigner : defaultSigners;
         const finalInput = { ...instructionParams, ...(accounts || {}) };
 
         const instruction = instructionFn(finalInput, {
@@ -76,7 +94,7 @@ export function createProgramHook<
         });
 
         // Get affected account addresses for query invalidation
-        const affectedAddresses = instruction.accounts?.map((account: Account) => account.address) || [];
+        const affectedAddresses = instruction.accounts?.map((account) => account.address) || [];
 
         console.log("[createProgramHook] Affected addresses:", affectedAddresses);
 
@@ -93,11 +111,15 @@ export function createProgramHook<
           ),
         );
 
-        console.log("[createProgramHook] Sending transaction...");
-        const signature = await config.signAndSend(instruction, signer);
+        console.log("[createProgramHook] Sending transaction with signers:", signerToUse ? signerToUse : "none");
+        const signature = await config.signAndSend(instruction, signerToUse);
         console.log("[createProgramHook] Transaction sent:", signature);
 
-        await new Promise((resolve) => setTimeout(resolve, refetchDelay));
+        // Small delay to allow RPC nodes to update state
+        if (refetchDelay > 0) {
+          console.log(`[createProgramHook] Waiting ${refetchDelay}ms for RPC state propagation...`);
+          await new Promise((resolve) => setTimeout(resolve, refetchDelay));
+        }
 
         console.log("[createProgramHook] Refetching queries...");
         await Promise.all(
