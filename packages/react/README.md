@@ -65,6 +65,8 @@ Fetch data from the Solana blockchain with the gill hooks:
 - [`useProgramAccounts`](#get-program-accounts-gpa) - get program accounts (GPA)
 - [`useTokenMint`](#get-token-mint-account) - get a decoded token's Mint account
 - [`useTokenAccount`](#get-token-account) - get the token account for a given mint and owner (or ATA)
+- [`useProgram`](#get-token-account) - provides mutations for query instructions and queries for program accounts for
+  Codama generated Solana programs
 
 ### Wrap your React app in a context provider
 
@@ -451,6 +453,217 @@ export function PageClient() {
   return (
     <div className="">
       <pre>signatures: {JSON.stringify(signatures, null, "\t")}</pre>
+    </div>
+  );
+}
+```
+
+### useProgram: Create useProgram hook
+
+Create useProgram hook using Codama-generated instruction builders and account fetchers:
+
+```tsx
+import { createProgramHook } from "@gillsdk/react";
+import {
+  getIncrementInstruction,
+  getInitializeInstruction,
+  getDecrementInstruction,
+  fetchCounter,
+} from "anchor/src/client/js";
+import { useWalletUiSignAndSend } from "@wallet-ui/react-gill";
+import { useSolanaClient } from "@gillsdk/react";
+import { address } from "gill";
+
+const PROGRAM_ID = address("nicktrLHhYzLmoVbuZQzHUTicd2sfP571orwo9jfc8c");
+
+export function useCounterProgram() {
+  const signAndSend = useWalletUiSignAndSend();
+  const { rpc } = useSolanaClient();
+
+  const hooks = createProgramHook({
+    instructions: {
+      initialize: getInitializeInstruction,
+      increment: getIncrementInstruction,
+      decrement: getDecrementInstruction,
+    },
+    accounts: {
+      counter: fetchCounter,
+    },
+    signAndSend,
+    rpc,
+    programAddress: PROGRAM_ID,
+    // Optional: Set default commitment level (defaults to 'confirmed')
+    // commitment: 'finalized',
+    // commitment: null, // Opt out of waiting - immediate refetch
+  });
+
+  return hooks;
+}
+```
+
+### useProgram: Setting commitment level for useProgram hook
+
+```tsx
+// 1. Config level (applies to all mutations)
+createProgramHook({
+  // ...
+  commitment: "confirmed", // Default for all mutations
+});
+
+// 2. Mutation level (overrides config)
+const incrementMutation = useProgramMutation({
+  instruction: "increment",
+  commitment: "finalized", // This mutation always waits for finalized
+});
+
+// 3. Transaction level (overrides mutation)
+incrementMutation.mutate({
+  params: { counter: address },
+  commitment: "confirmed", // Just this transaction uses confirmed
+});
+```
+
+### useProgram: useProgramMutation to call program instructions
+
+```tsx
+"use client";
+
+import { useCounterProgram } from "@/hooks/useCounterProgram";
+import { generateKeyPairSigner } from "gill";
+import { useWalletUiSigner } from "@wallet-ui/react";
+
+export function CounterExample({ account }) {
+  const signer = useWalletUiSigner({ account });
+  const { useProgramMutation } = useCounterProgram();
+
+  const initializeMutation = useProgramMutation({
+    instruction: "initialize",
+    defaultSigners: signer, // Default signer for all transactions
+    onSuccess: (signature) => {
+      console.log("Initialize successful:", signature);
+    },
+    onError: (error) => {
+      console.error("Initialize failed:", error);
+    },
+  });
+
+  return (
+    <button
+      onClick={async () => {
+        const counter = await generateKeyPairSigner();
+        initializeMutation.mutate({
+          params: {
+            counter,
+            payer: signer,
+          },
+          signers: [signer, counter],
+        });
+      }}
+      disabled={initializeMutation.isPending}
+    >
+      {initializeMutation.isPending ? "Initializing..." : "Initialize Counter"}
+    </button>
+  );
+}
+```
+
+### useProgram: useProgramQuery to query program accounts
+
+```tsx
+"use client";
+
+import { useSolanaClient } from "@gillsdk/react";
+import { useCounterProgram } from "@/hooks/useCounterProgram";
+
+export function CounterDisplay({ counterAddress }) {
+  const { rpc } = useSolanaClient();
+  const { useProgramQuery } = useCounterProgram();
+
+  const counterQuery = useProgramQuery({
+    account: "counter",
+    address: counterAddress,
+    rpc,
+    enabled: !!counterAddress, // Only fetch when address exists
+  });
+
+  if (counterQuery.isLoading) return <p>Loading...</p>;
+  if (counterQuery.isError) return <p>Error: {counterQuery.error.message}</p>;
+
+  return (
+    <div>
+      <p>Count: {counterQuery.data.data.count}</p>
+    </div>
+  );
+}
+```
+
+### useProgram: useProgramMutation with PDA
+
+```tsx
+"use client";
+
+import { createProgramHook } from "@gillsdk/react";
+import { getInitializeInstructionAsync, getDepositInstructionAsync, fetchVaultState } from "anchor/src/vault/client/js";
+
+export function useVaultProgram() {
+  const signAndSend = useWalletUiSignAndSend();
+  const { rpc } = useSolanaClient();
+
+  // Use async instruction builders for PDA derivation
+  const hooks = createProgramHook({
+    instructions: {
+      initialize: getInitializeInstructionAsync,
+      deposit: getDepositInstructionAsync,
+    },
+    accounts: {
+      vaultState: fetchVaultState,
+    },
+    signAndSend,
+    rpc,
+  });
+
+  return hooks;
+}
+```
+
+```tsx
+"use client";
+
+import { useVaultProgram } from "@/hooks/useVaultProgram";
+import { useState } from "react";
+
+export function VaultExample({ account }) {
+  const signer = useWalletUiSigner({ account });
+  const [amount, setAmount] = useState("");
+  const { useProgramMutation } = useVaultProgram();
+
+  const depositMutation = useProgramMutation({
+    instruction: "deposit",
+    defaultSigners: signer,
+    commitment: "finalized", // Wait for finalized before refetch
+    onSuccess: (signature) => {
+      console.log("Deposit successful:", signature);
+      setAmount("");
+    },
+  });
+
+  return (
+    <div>
+      <input value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Amount" />
+      <button
+        onClick={() =>
+          depositMutation.mutate({
+            params: {
+              user: signer,
+              amount: parseFloat(amount) * 1_000_000_000, // Convert to lamports
+            },
+            // Uses defaultSigners, no need to specify here
+          })
+        }
+        disabled={depositMutation.isPending}
+      >
+        {depositMutation.isPending ? "Depositing..." : "Deposit"}
+      </button>
     </div>
   );
 }

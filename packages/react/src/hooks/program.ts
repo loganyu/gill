@@ -18,19 +18,26 @@ type InstructionBuilder<TInput = any> = (input: TInput, config?: { programAddres
 type AccountFetcher<TData = any> = (rpc: any, address: Address, config?: any) => Promise<TData>;
 
 type Signer = any;
-type SignerOrSigners = Signer | Signer[];
+type SignerOrSigners = Signer | Signer[] | null;
+type CommitmentLevel = "confirmed" | "finalized";
 
-type SignAndSendFn = (instruction: Instruction, signers?: SignerOrSigners) => Promise<string>;
+type SignAndSendFn = (
+  instruction: Instruction,
+  signers?: SignerOrSigners,
+  options?: { commitment?: CommitmentLevel },
+) => Promise<string>;
 
 type ProgramHookConfig<
   TInstructions extends Record<string, InstructionBuilder<any>>,
   TAccounts extends Record<string, AccountFetcher<any>>,
 > = {
   accounts: TAccounts;
+  commitment?: CommitmentLevel | null;
   instructions: TInstructions;
   programAddress?: Address;
   /** Time to wait after transaction confirmation before refetching (default: 500ms) */
   refetchDelay?: number;
+  rpc?: any;
   signAndSend: SignAndSendFn;
 };
 
@@ -43,6 +50,7 @@ type UseProgramMutationInput<
     string,
     Error,
     Parameters<TInstructions[TInstructionName]>[0] & {
+      commitment?: CommitmentLevel | null;
       signer?: SignerOrSigners;
     }
   >,
@@ -51,6 +59,7 @@ type UseProgramMutationInput<
   accounts?: Record<string, any> & {
     [K in keyof TAccounts]?: Parameters<TAccounts[K]>[0];
   };
+  commitment?: CommitmentLevel | null;
   defaultSigners?: SignerOrSigners;
   instruction: TInstructionName;
 };
@@ -64,29 +73,83 @@ type UseProgramQueryInput<
   rpc: Parameters<TAccounts[TAccountName]>[0];
 };
 
+async function waitForConfirmation(rpc: any, signature: string, commitment: CommitmentLevel): Promise<void> {
+  if (!rpc || !rpc.getSignatureStatuses) {
+    console.warn("[createProgramHook] RPC client not available, skipping confirmation wait");
+    return;
+  }
+
+  const maxRetries = 15;
+  const initialDelay = commitment === "finalized" ? 2000 : 100;
+  const maxDelay = 2000; 
+  let retryCount = 0;
+  let delay = initialDelay;
+
+  console.log(`[createProgramHook] Waiting for ${commitment} confirmation of ${signature}...`);
+
+  while (retryCount < maxRetries) {
+    try {
+      const response = await rpc.getSignatureStatuses([signature]).send();
+      const status = response.value?.[0];
+
+      if (status?.err) {
+        throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+      }
+
+      if (status?.confirmationStatus) {
+        const currentLevel = status.confirmationStatus;
+        console.log(`[createProgramHook] Current confirmation level: ${currentLevel}`);
+
+        if (currentLevel === commitment || (commitment === "confirmed" && currentLevel === "finalized")) {
+          console.log(`[createProgramHook] Transaction reached ${commitment} confirmation`);
+          return;
+        }
+      } else if (status === null) {
+        console.log(`[createProgramHook] Transaction not found yet (attempt ${retryCount + 1}/${maxRetries})`);
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 1.2, maxDelay);
+      retryCount++;
+    } catch (error) {
+      console.error("[createProgramHook] Error checking transaction status:", error);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+      delay = Math.min(delay * 1.2, maxDelay);
+      retryCount++;
+      if (error instanceof Error && error.message.includes("Transaction failed")) {
+        throw error;
+      }
+    }
+  }
+}
+
 export function createProgramHook<
   TInstructions extends Record<string, InstructionBuilder<any>>,
   TAccounts extends Record<string, AccountFetcher<any>>,
 >(config: ProgramHookConfig<TInstructions, TAccounts>) {
-  const refetchDelay = config.refetchDelay ?? 500;
+  const defaultCommitment = config.commitment === undefined ? "confirmed" : config.commitment;
 
   function useProgramMutation<TInstructionName extends keyof TInstructions>(
     input: UseProgramMutationInput<TInstructions, TAccounts, TInstructionName>,
   ) {
     const queryClient = useQueryClient();
-    const { instruction, accounts, defaultSigners, ...options } = input;
+    const { instruction, accounts, defaultSigners, commitment: mutationCommitment, ...options } = input;
     const instructionFn = config.instructions[instruction];
 
     return useMutation({
       ...options,
       mutationFn: async (
-        instructionInput: Parameters<TInstructions[TInstructionName]>[0] & { signer?: SignerOrSigners },
+        instructionInput: Parameters<TInstructions[TInstructionName]>[0] & {
+          commitment?: CommitmentLevel;
+          signer?: SignerOrSigners;
+        },
       ) => {
         if (!instructionInput) {
           throw new Error("Instruction input is required");
         }
-        const { signer: inputSigner, ...instructionParams } = instructionInput;
+        const { signer: inputSigner, commitment: inputCommitment, ...instructionParams } = instructionInput;
         const signerToUse = inputSigner !== undefined ? inputSigner : defaultSigners;
+        const commitmentToUse = inputCommitment ?? mutationCommitment ?? defaultCommitment;
         const finalInput = { ...instructionParams, ...(accounts || {}) };
 
         const instruction = instructionFn(finalInput, {
@@ -112,13 +175,18 @@ export function createProgramHook<
         );
 
         console.log("[createProgramHook] Sending transaction with signers:", signerToUse ? signerToUse : "none");
-        const signature = await config.signAndSend(instruction, signerToUse);
+        const signature = await config.signAndSend(
+          instruction,
+          signerToUse,
+          commitmentToUse ? { commitment: commitmentToUse } : undefined,
+        );
         console.log("[createProgramHook] Transaction sent:", signature);
 
-        // Small delay to allow RPC nodes to update state
-        if (refetchDelay > 0) {
-          console.log(`[createProgramHook] Waiting ${refetchDelay}ms for RPC state propagation...`);
-          await new Promise((resolve) => setTimeout(resolve, refetchDelay));
+        console.log("commitmentToUse:", commitmentToUse, config.rpc);
+        if (commitmentToUse && config.rpc) {
+          console.log("[createProgramHook] waiting for confirmation");
+          await waitForConfirmation(config.rpc, signature, commitmentToUse);
+          console.log("[createProgramHook] confirmation complete");
         }
 
         console.log("[createProgramHook] Refetching queries...");
