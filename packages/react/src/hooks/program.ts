@@ -10,21 +10,25 @@ import {
   type UseQueryOptions,
 } from "@tanstack/react-query";
 import type { Address, Instruction } from "gill";
+import {
+  createSolanaClient,
+  createTransaction,
+  type Signature,
+  type SolanaClient,
+  type TransactionSendingSigner,
+} from "gill";
 
 import { GILL_HOOK_CLIENT_KEY } from "../const.js";
 
-type InstructionBuilder<TInput = any> = (input: TInput, config?: { programAddress?: Address }) => Instruction;
+type InstructionBuilder<TInput = any> = (input: TInput, config?: { programAddress: Address }) => Instruction;
 
-type AccountFetcher<TData = any> = (rpc: any, address: Address, config?: any) => Promise<TData>;
+type AccountFetcher<TData = any> = (rpc: SolanaClient["rpc"], address: Address, config?: any) => Promise<TData>;
 
-type Signer = any;
-type SignerOrSigners = Signer | Signer[] | null;
 type CommitmentLevel = "confirmed" | "finalized";
 
 type SignAndSendFn = (
   instruction: Instruction,
-  signers?: SignerOrSigners,
-  options?: { commitment?: CommitmentLevel },
+  signer: TransactionSendingSigner,
 ) => Promise<string>;
 
 type ProgramHookConfig<
@@ -34,33 +38,27 @@ type ProgramHookConfig<
   accounts: TAccounts;
   commitment?: CommitmentLevel | null;
   instructions: TInstructions;
-  programAddress?: Address;
-  /** Time to wait after transaction confirmation before refetching (default: 500ms) */
-  refetchDelay?: number;
-  rpc?: any;
-  signAndSend: SignAndSendFn;
+  programAddress: Address;
 };
 
 type UseProgramMutationInput<
   TInstructions extends Record<string, InstructionBuilder<any>>,
-  TAccounts extends Record<string, AccountFetcher<any>>,
   TInstructionName extends keyof TInstructions,
 > = Omit<
   UseMutationOptions<
     string,
     Error,
-    Parameters<TInstructions[TInstructionName]>[0] & {
+    {
       commitment?: CommitmentLevel | null;
-      signer?: SignerOrSigners;
+      params: Parameters<TInstructions[TInstructionName]>[0];
+      rpc: SolanaClient['rpc'];
+      signAndSend: SignAndSendFn;
+      signer: TransactionSendingSigner;
     }
   >,
   "mutationFn"
 > & {
-  accounts?: Record<string, any> & {
-    [K in keyof TAccounts]?: Parameters<TAccounts[K]>[0];
-  };
   commitment?: CommitmentLevel | null;
-  defaultSigners?: SignerOrSigners;
   instruction: TInstructionName;
 };
 
@@ -73,21 +71,21 @@ type UseProgramQueryInput<
   rpc: Parameters<TAccounts[TAccountName]>[0];
 };
 
-async function waitForConfirmation(rpc: any, signature: string, commitment: CommitmentLevel): Promise<void> {
-  if (!rpc || !rpc.getSignatureStatuses) {
-    console.warn("[createProgramHook] RPC client not available, skipping confirmation wait");
-    return;
-  }
+const CONFIRM_TRANSATION_MAX_RETRIES = 15;
+const CONFIRM_TRANSATION_COMMITMENT_FINALIZED_MILLISECOND_DELAY = 2000;
+const CONFIRM_TRANSATION_COMMITMENT_CONFIRMED_MILLISECOND_DELAY = 100;
+const CONFIRM_TRANSATION_MAX_MILLISECOND_DELAY = 2000;
 
-  const maxRetries = 15;
-  const initialDelay = commitment === "finalized" ? 2000 : 100;
-  const maxDelay = 2000; 
+
+async function waitForConfirmation(rpc: SolanaClient['rpc'], signature: Signature, commitment: CommitmentLevel): Promise<void> {
+  const initialDelay =
+    commitment === "finalized"
+      ? CONFIRM_TRANSATION_COMMITMENT_FINALIZED_MILLISECOND_DELAY
+      : CONFIRM_TRANSATION_COMMITMENT_CONFIRMED_MILLISECOND_DELAY;
   let retryCount = 0;
   let delay = initialDelay;
 
-  console.log(`[createProgramHook] Waiting for ${commitment} confirmation of ${signature}...`);
-
-  while (retryCount < maxRetries) {
+  while (retryCount < CONFIRM_TRANSATION_MAX_RETRIES) {
     try {
       const response = await rpc.getSignatureStatuses([signature]).send();
       const status = response.value?.[0];
@@ -98,23 +96,18 @@ async function waitForConfirmation(rpc: any, signature: string, commitment: Comm
 
       if (status?.confirmationStatus) {
         const currentLevel = status.confirmationStatus;
-        console.log(`[createProgramHook] Current confirmation level: ${currentLevel}`);
 
         if (currentLevel === commitment || (commitment === "confirmed" && currentLevel === "finalized")) {
-          console.log(`[createProgramHook] Transaction reached ${commitment} confirmation`);
           return;
         }
-      } else if (status === null) {
-        console.log(`[createProgramHook] Transaction not found yet (attempt ${retryCount + 1}/${maxRetries})`);
       }
 
       await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 1.2, maxDelay);
+      delay = Math.min(delay * 1.2, CONFIRM_TRANSATION_MAX_MILLISECOND_DELAY);
       retryCount++;
     } catch (error) {
-      console.error("[createProgramHook] Error checking transaction status:", error);
       await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 1.2, maxDelay);
+      delay = Math.min(delay * 1.2, CONFIRM_TRANSATION_MAX_MILLISECOND_DELAY);
       retryCount++;
       if (error instanceof Error && error.message.includes("Transaction failed")) {
         throw error;
@@ -133,83 +126,51 @@ export function createProgramHook<
     input: UseProgramMutationInput<TInstructions, TAccounts, TInstructionName>,
   ) {
     const queryClient = useQueryClient();
-    const { instruction, accounts, defaultSigners, commitment: mutationCommitment, ...options } = input;
+    const { instruction, commitment: mutationCommitment, ...options } = input;
     const instructionFn = config.instructions[instruction];
 
     return useMutation({
       ...options,
-      mutationFn: async (
-        instructionInput: Parameters<TInstructions[TInstructionName]>[0] & {
-          commitment?: CommitmentLevel;
-          signer?: SignerOrSigners;
-        },
-      ) => {
-        if (!instructionInput) {
-          throw new Error("Instruction input is required");
+      mutationFn: async (input: {
+        commitment?: CommitmentLevel;
+        params: Parameters<TInstructions[TInstructionName]>[0];
+        rpc: SolanaClient['rpc'];
+        signAndSend: SignAndSendFn;
+        signer: TransactionSendingSigner;
+      }) => {
+        if (!input.params) {
+          throw new Error("Instruction params are required");
         }
-        const { signer: inputSigner, commitment: inputCommitment, ...instructionParams } = instructionInput;
-        const signerToUse = inputSigner !== undefined ? inputSigner : defaultSigners;
+        const { params, signer, commitment: inputCommitment, rpc, signAndSend } = input;
         const commitmentToUse = inputCommitment ?? mutationCommitment ?? defaultCommitment;
-        const finalInput = { ...instructionParams, ...(accounts || {}) };
 
-        const instruction = instructionFn(finalInput, {
-          programAddress: config.programAddress,
+        const instruction = instructionFn(params);
+
+        const { simulateTransaction } = createSolanaClient({
+          urlOrMoniker: "devnet",
         });
 
-        // Get affected account addresses for query invalidation
-        const affectedAddresses = instruction.accounts?.map((account) => account.address) || [];
+        const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
 
-        console.log("[createProgramHook] Affected addresses:", affectedAddresses);
+        const transaction = createTransaction({
+          feePayer: signer,
+          instructions: [instruction],
+          latestBlockhash,
+          version: 0,
+        });
 
-        // Cancel any outgoing refetches for affected accounts
-        await Promise.all(
-          affectedAddresses.map((address: Address) =>
-            queryClient.cancelQueries({
-              predicate: (query) => {
-                const queryKey = query.queryKey as string[];
-                return queryKey.includes(address);
-              },
-              queryKey: [GILL_HOOK_CLIENT_KEY, "account"],
-            }),
-          ),
-        );
+        const simulation = await simulateTransaction(transaction);
+        console.log("simulation", simulation);
 
-        console.log("[createProgramHook] Sending transaction with signers:", signerToUse ? signerToUse : "none");
-        const signature = await config.signAndSend(
-          instruction,
-          signerToUse,
-          commitmentToUse ? { commitment: commitmentToUse } : undefined,
-        );
-        console.log("[createProgramHook] Transaction sent:", signature);
+        const signature = await signAndSend(instruction, signer);
 
-        console.log("commitmentToUse:", commitmentToUse, config.rpc);
-        if (commitmentToUse && config.rpc) {
-          console.log("[createProgramHook] waiting for confirmation");
-          await waitForConfirmation(config.rpc, signature, commitmentToUse);
-          console.log("[createProgramHook] confirmation complete");
+        if (commitmentToUse) {
+          await waitForConfirmation(rpc, signature as Signature, commitmentToUse);
         }
 
-        console.log("[createProgramHook] Refetching queries...");
-        await Promise.all(
-          affectedAddresses.map(async (address: Address) => {
-            const result = await queryClient.refetchQueries({
-              predicate: (query) => {
-                const queryKey = query.queryKey as string[];
-                const matches = queryKey.includes(address);
-                if (matches) {
-                  console.log("[createProgramHook] Refetching query:", queryKey);
-                }
-                return matches;
-              },
-              queryKey: [GILL_HOOK_CLIENT_KEY, "account"],
-              type: "active",
-            });
-            console.log("[createProgramHook] Refetch result for", address, ":", result);
-            return result;
-          }),
-        );
-
-        console.log("[createProgramHook] Refetch complete");
+        await queryClient.refetchQueries({
+          queryKey: [GILL_HOOK_CLIENT_KEY, config.programAddress],
+        });
 
         return signature;
       },
@@ -224,12 +185,10 @@ export function createProgramHook<
       ...options,
       enabled: options.enabled !== false && !!address && !!rpc,
       queryFn: async () => {
-        console.log("[useProgramQuery] Fetching account:", account, address);
         const data = await accountFetcher(rpc, address);
-        console.log("[useProgramQuery] Fetched data:", data);
         return data;
       },
-      queryKey: [GILL_HOOK_CLIENT_KEY, "account", account, address],
+      queryKey: [GILL_HOOK_CLIENT_KEY, config.programAddress, account, address],
       staleTime: options.staleTime ?? 1000,
     });
   }
