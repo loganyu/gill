@@ -9,12 +9,7 @@ import {
   useQueryClient,
   type UseQueryOptions,
 } from "@tanstack/react-query";
-import type { Address, Instruction } from "gill";
-import {
-  type Signature,
-  type SolanaClient,
-  type TransactionSendingSigner
-} from "gill";
+import type { Address, Instruction, Signature, SolanaClient, TransactionSendingSigner } from "gill";
 
 import { GILL_HOOK_CLIENT_KEY } from "../const.js";
 
