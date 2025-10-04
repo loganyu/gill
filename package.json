@@ -19,7 +19,6 @@
     "codama:generate": "./idls/build-codama-clients.sh",
     "compile:docs": "turbo run --concurrency=${TURBO_CONCURRENCY:-95.84%} compile:docs",
     "test": "turbo run --concurrency=${TURBO_CONCURRENCY:-95.84%} test",
-    "test:typecheck": "turbo run --concurrency=${TURBO_CONCURRENCY:-95.84%} test:typecheck",
     "test:treeshakability:native": "turbo run --concurrency=${TURBO_CONCURRENCY:-95.84%} test:treeshakability:native",
     "test:treeshakability:browser": "turbo run --concurrency=${TURBO_CONCURRENCY:-95.84%} test:treeshakability:browser",
     "test:treeshakability:node": "turbo run --concurrency=${TURBO_CONCURRENCY:-95.84%} test:treeshakability:node",
@@ -74,13 +73,7 @@
     "typedoc-plugin-markdown": "^4.6.3",
     "typedoc-plugin-mdn-links": "^5.0.2"
   },
-  "peerDependencies": {
-    "react": "^19.1.1",
-    "react-dom": "^19.1.1",
-    "@types/react": "^19.1.13",
-    "@types/react-dom": "^19.1.9"
-  },
-  "packageManager": "pnpm@10.17.1",
+  "packageManager": "pnpm@9.1.0",
   "author": "Nick Frostbutter <maintainers@gillsdk.com>",
   "homepage": "https://gillsdk.com",
   "bugs": {
