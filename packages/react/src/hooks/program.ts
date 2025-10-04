@@ -11,11 +11,9 @@ import {
 } from "@tanstack/react-query";
 import type { Address, Instruction } from "gill";
 import {
-  createSolanaClient,
-  createTransaction,
   type Signature,
   type SolanaClient,
-  type TransactionSendingSigner,
+  type TransactionSendingSigner
 } from "gill";
 
 import { GILL_HOOK_CLIENT_KEY } from "../const.js";
@@ -143,25 +141,7 @@ export function createProgramHook<
         }
         const { params, signer, commitment: inputCommitment, rpc, signAndSend } = input;
         const commitmentToUse = inputCommitment ?? mutationCommitment ?? defaultCommitment;
-
         const instruction = instructionFn(params);
-
-        const { simulateTransaction } = createSolanaClient({
-          urlOrMoniker: "devnet",
-        });
-
-        const { value: latestBlockhash } = await rpc.getLatestBlockhash().send();
-
-        const transaction = createTransaction({
-          feePayer: signer,
-          instructions: [instruction],
-          latestBlockhash,
-          version: 0,
-        });
-
-        const simulation = await simulateTransaction(transaction);
-        console.log("simulation", simulation);
-
         const signature = await signAndSend(instruction, signer);
 
         if (commitmentToUse) {
