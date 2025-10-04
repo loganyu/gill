@@ -123,7 +123,7 @@ export function createProgramHook<
   const defaultCommitment = config.commitment === undefined ? "confirmed" : config.commitment;
 
   function useProgramMutation<TInstructionName extends keyof TInstructions>(
-    input: UseProgramMutationInput<TInstructions, TAccounts, TInstructionName>,
+    input: UseProgramMutationInput<TInstructions, TInstructionName>,
   ) {
     const queryClient = useQueryClient();
     const { instruction, commitment: mutationCommitment, ...options } = input;
