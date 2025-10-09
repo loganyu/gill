@@ -12,10 +12,11 @@ import {
 import type { Address, Instruction, Signature, SolanaClient, TransactionSendingSigner } from "gill";
 
 import { GILL_HOOK_CLIENT_KEY } from "../const.js";
+import { useSolanaClient } from "./client.js";
 
 type InstructionBuilder<TInput = any> = (input: TInput, config?: { programAddress: Address }) => Instruction;
 
-type AccountFetcher<TData = any> = (rpc: SolanaClient["rpc"], address: Address, config?: any) => Promise<TData>;
+type AccountFetcher<TData = any> = (rpc: SolanaClient["rpc"], config?: any) => Promise<TData>;
 
 type CommitmentLevel = "confirmed" | "finalized";
 
@@ -44,7 +45,6 @@ type UseProgramMutationInput<
     {
       commitment?: CommitmentLevel | null;
       params: Parameters<TInstructions[TInstructionName]>[0];
-      rpc: SolanaClient['rpc'];
       signAndSend: SignAndSendFn;
       signer: TransactionSendingSigner;
     }
@@ -61,52 +61,45 @@ type UseProgramQueryInput<
 > = Omit<UseQueryOptions<Awaited<ReturnType<TAccounts[TAccountName]>>, Error>, "queryFn" | "queryKey"> & {
   account: TAccountName;
   address: Address;
-  rpc: Parameters<TAccounts[TAccountName]>[0];
 };
 
-const CONFIRM_TRANSATION_MAX_RETRIES = 15;
-const CONFIRM_TRANSATION_COMMITMENT_FINALIZED_MILLISECOND_DELAY = 2000;
-const CONFIRM_TRANSATION_COMMITMENT_CONFIRMED_MILLISECOND_DELAY = 100;
-const CONFIRM_TRANSATION_MAX_MILLISECOND_DELAY = 2000;
+const FINALIZED_DELAYS = [10000, 3000, 3000, 3000, 3000];
+const CONFIRMED_DELAYS = [1500, 500, 500, 500];
 
+async function waitForConfirmation(
+  rpc: SolanaClient["rpc"],
+  signature: Signature,
+  commitment: CommitmentLevel,
+): Promise<boolean> {
+  const delays = commitment === "finalized" ? FINALIZED_DELAYS : CONFIRMED_DELAYS;
 
-async function waitForConfirmation(rpc: SolanaClient['rpc'], signature: Signature, commitment: CommitmentLevel): Promise<void> {
-  const initialDelay =
-    commitment === "finalized"
-      ? CONFIRM_TRANSATION_COMMITMENT_FINALIZED_MILLISECOND_DELAY
-      : CONFIRM_TRANSATION_COMMITMENT_CONFIRMED_MILLISECOND_DELAY;
-  let retryCount = 0;
-  let delay = initialDelay;
-
-  while (retryCount < CONFIRM_TRANSATION_MAX_RETRIES) {
+  let transactionConfirmed = false;
+  for (let retryCount = 0; retryCount < delays.length; retryCount++) {
     try {
+      await new Promise((resolve) => setTimeout(resolve, delays[retryCount]));
+
       const response = await rpc.getSignatureStatuses([signature]).send();
       const status = response.value?.[0];
 
       if (status?.err) {
         throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
       }
-
       if (status?.confirmationStatus) {
         const currentLevel = status.confirmationStatus;
-
-        if (currentLevel === commitment || (commitment === "confirmed" && currentLevel === "finalized")) {
-          return;
+        const isConfirmed = currentLevel === commitment || (commitment === "confirmed" && currentLevel === "finalized");
+        if (isConfirmed) {
+          transactionConfirmed = true;
+          return true;
         }
       }
-
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 1.2, CONFIRM_TRANSATION_MAX_MILLISECOND_DELAY);
-      retryCount++;
     } catch (error) {
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      delay = Math.min(delay * 1.2, CONFIRM_TRANSATION_MAX_MILLISECOND_DELAY);
-      retryCount++;
       if (error instanceof Error && error.message.includes("Transaction failed")) {
         throw error;
       }
     }
   }
+
+  return transactionConfirmed;
 }
 
 export function createProgramHook<
@@ -114,6 +107,7 @@ export function createProgramHook<
   TAccounts extends Record<string, AccountFetcher<any>>,
 >(config: ProgramHookConfig<TInstructions, TAccounts>) {
   const defaultCommitment = config.commitment === undefined ? "confirmed" : config.commitment;
+  const { rpc } = useSolanaClient();
 
   function useProgramMutation<TInstructionName extends keyof TInstructions>(
     input: UseProgramMutationInput<TInstructions, TInstructionName>,
@@ -134,18 +128,23 @@ export function createProgramHook<
         if (!input.params) {
           throw new Error("Instruction params are required");
         }
-        const { params, signer, commitment: inputCommitment, rpc, signAndSend } = input;
+        const { params, signer, commitment: inputCommitment, signAndSend } = input;
         const commitmentToUse = inputCommitment ?? mutationCommitment ?? defaultCommitment;
         const instruction = instructionFn(params);
         const signature = await signAndSend(instruction, signer);
 
+        let confirmed;
         if (commitmentToUse) {
-          await waitForConfirmation(rpc, signature as Signature, commitmentToUse);
+          confirmed = await waitForConfirmation(rpc, signature as Signature, commitmentToUse);
         }
 
-        await queryClient.refetchQueries({
+        await queryClient.invalidateQueries({
           queryKey: [GILL_HOOK_CLIENT_KEY, config.programAddress],
         });
+
+        if (commitmentToUse && !confirmed) {
+          throw new Error(`Unable to confirm commitment level for transaction ${signature}`);
+        }
 
         return signature;
       },
@@ -153,7 +152,8 @@ export function createProgramHook<
   }
 
   function useProgramQuery<TAccountName extends keyof TAccounts>(input: UseProgramQueryInput<TAccounts, TAccountName>) {
-    const { account, address, rpc, ...options } = input;
+    const { account, address, ...options } = input;
+    const { rpc, urlOrMoniker } = useSolanaClient();
     const accountFetcher = config.accounts[account];
 
     return useQuery({
@@ -163,7 +163,7 @@ export function createProgramHook<
         const data = await accountFetcher(rpc, address);
         return data;
       },
-      queryKey: [GILL_HOOK_CLIENT_KEY, config.programAddress, account, address],
+      queryKey: [GILL_HOOK_CLIENT_KEY, config.programAddress, urlOrMoniker, account, address],
       staleTime: options.staleTime ?? 1000,
     });
   }
