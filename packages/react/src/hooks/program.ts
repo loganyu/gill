@@ -121,7 +121,6 @@ export function createProgramHook<
       mutationFn: async (input: {
         commitment?: CommitmentLevel;
         params: Parameters<TInstructions[TInstructionName]>[0];
-        rpc: SolanaClient['rpc'];
         signAndSend: SignAndSendFn;
         signer: TransactionSendingSigner;
       }) => {
